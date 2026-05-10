@@ -24,7 +24,7 @@ public:
         roi_ratio_       = declare_parameter<double>("roi_ratio", 0.6); 
         auto_threshold_  = declare_parameter<bool>("auto_threshold", true);
         threshold_       = declare_parameter<int>("threshold", 210);
-        auto_thresh_k_   = declare_parameter<double>("auto_thresh_k", 0.6);
+        auto_thresh_k_   = declare_parameter<double>("auto_thresh_k", 0.6); // 建议在 launch 中改为 0.85 滤除光斑
         auto_thresh_min_ = declare_parameter<int>("auto_thresh_min", 160);
         auto_thresh_max_ = declare_parameter<int>("auto_thresh_max", 235);
         
@@ -37,20 +37,23 @@ public:
         close_ksize_ = declare_parameter<int>("close_ksize", 9);
         open_ksize_  = declare_parameter<int>("open_ksize", 5);
         border_margin_px_ = declare_parameter<int>("border_margin_px", 0);
+        enable_bottom_touch_filter_ = declare_parameter<bool>("enable_bottom_touch_filter", true);
+        bottom_touch_check_rows_ = declare_parameter<int>("bottom_touch_check_rows", 10);
+        min_bottom_touch_rows_ = declare_parameter<int>("min_bottom_touch_rows", 2);
 
-        // ==========================================
-        // 【核心修改 1：将正方形窗口拆分为宽扁矩形】
-        // ==========================================
-        window_width_  = declare_parameter<int>("window_width", 160); 
-        window_height_ = declare_parameter<int>("window_height", 40); 
-        num_windows_   = declare_parameter<int>("num_windows", 4); 
-        region_weights_ = declare_parameter<std::vector<double>>("region_weights", {0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0}); // 默认左四为0，右四为1 
+        // 保留旧参数防报错
+        declare_parameter<int>("window_width", 160); 
+        declare_parameter<int>("window_height", 40); 
+        declare_parameter<int>("num_windows", 4); 
+        declare_parameter<std::vector<double>>("region_weights", {0.0});
         
         show_fps_overlay_ = declare_parameter<bool>("show_fps_overlay", true);
         fps_ema_alpha_    = declare_parameter<double>("fps_ema_alpha", 0.2);
+        local_debug_display_ = declare_parameter<bool>("local_debug_display", true);
         
-        // 【核心修改 2：开启原生 OpenCV 显示后门】
-        local_debug_display_ = declare_parameter<bool>("local_debug_display", true); 
+        batch_mode_        = declare_parameter<bool>("batch_mode", false);
+        input_video_path_  = declare_parameter<std::string>("input_video_path", "");
+        output_video_path_ = declare_parameter<std::string>("output_video_path", "debug_batch.mp4");
 
         corner_pub_ = create_publisher<geometry_msgs::msg::Point>(corner_topic_, 10);
         debug_pub_  = create_publisher<sensor_msgs::msg::Image>(debug_topic_, 10);
@@ -60,7 +63,7 @@ public:
             image_topic_, rclcpp::SensorDataQoS(),
             std::bind(&EightNavNode::onImage, this, std::placeholders::_1));
 
-        RCLCPP_INFO(get_logger(), "八邻域巡线启动. 模式: 宽扁窗口 + 原生视窗输出.");
+        RCLCPP_INFO(get_logger(), "八邻域摩尔追踪：加入光斑垂直跨度过滤与完美 L/T 区分机制！");
     }
 
 private:
@@ -76,13 +79,13 @@ private:
         }
     }
 
-    void processFrame(const cv::Mat& frame, const std_msgs::msg::Header& header) {
+    cv::Mat processFrame(const cv::Mat& frame, const std_msgs::msg::Header& header) {
         int w = frame.cols;
         int h = frame.rows;
 
         int roi_y = static_cast<int>(h * (1.0 - roi_ratio_));
         int roi_h = h - roi_y;
-        if (roi_y < 0 || roi_h <= 0) return;
+        if (roi_y < 0 || roi_h <= 0) return frame;
         cv::Rect roi_rect(0, roi_y, w, roi_h);
         cv::Mat roi = frame(roi_rect);
 
@@ -127,108 +130,144 @@ private:
         cv::rectangle(debug_vis, roi_rect, cv::Scalar(255, 255, 0), 2);
 
         // ==========================================
-        // 【核心逻辑重构：动态找点 + 宽扁窗口防吞噬】
+        // 【核心：八邻域 Moore 边界追踪】
         // ==========================================
-        int current_y = roi_h - window_height_ / 2;
-        int current_x = w / 2;
-
-        // 1. 在底部扫一条横线，找寻真实的白线起点，防止锚定在画面中央
-        int search_y_start = std::max(0, roi_h - window_height_);
-        cv::Mat bottom_strip = binary.rowRange(search_y_start, roi_h);
-        cv::Moments M_bottom = cv::moments(bottom_strip, true);
-        if (M_bottom.m00 > 0) {
-            current_x = static_cast<int>(M_bottom.m10 / M_bottom.m00);
-        }
-
-        bool is_dead_end = false;
-        bool is_junction = false; // 【新增】用来记录当前帧是否发现了路口
-
-        for (int i = 0; i < num_windows_; ++i) {
-            int x_min = std::max(0, current_x - window_width_ / 2);
-            int x_max = std::min(w - 1, current_x + window_width_ / 2);
-            int y_min = std::max(0, current_y - window_height_ / 2);
-            int y_max = std::min(roi_h - 1, current_y + window_height_ / 2);
-
-            cv::Rect window_rect(x_min, y_min, x_max - x_min, y_max - y_min);
-            if (window_rect.area() <= 0) break;
-
-            cv::Mat window_roi = binary(window_rect);
-            int branches = countTransitions(window_roi);
-
-            cv::Moments M = cv::moments(window_roi, true);
-            double white_ratio = M.m00 / window_rect.area(); 
-            
-            if (branches <= 1 && i == 0) {
-                if (white_ratio < 0.1) {
-                    is_dead_end = true; 
-                    break;
-                }
-            }
-
-            // 【新增】默认框是绿色 (B, G, R)
-            cv::Scalar box_color(0, 255, 0); 
-
-            // 遇到路口倾向右转
-            if (branches >= 3) {
-                cv::Mat weighted_roi;
-                window_roi.convertTo(weighted_roi, CV_32F);
-
-                int strip_w = window_roi.cols / 8;
-                for (int j = 0; j < 8; ++j) {
-                    int x_start = j * strip_w;
-                    int x_end = (j == 7) ? window_roi.cols : (j + 1) * strip_w;
         
-                    // 应用权重：将该区域像素值乘以对应的权重系数
-                    cv::Mat strip = weighted_roi.colRange(x_start, x_end);
-                    strip *= region_weights_[j];
+        int total_white_pixels = cv::countNonZero(binary);
+        double global_white_ratio = (double)total_white_pixels / (roi_rect.area());
+        bool is_dead_end = (global_white_ratio < 0.015); 
+
+        cv::Point center_seed(-1, -1);
+        if (!is_dead_end) {
+            int mid_x = w / 2;
+            for (int y = roi_h - 5; y >= 0; y--) { 
+                for (int x_offset = 0; x_offset < w / 2; x_offset += 2) {
+                    if (binary.at<uchar>(y, mid_x + x_offset) > 0) { center_seed = cv::Point(mid_x + x_offset, y); break; }
+                    if (binary.at<uchar>(y, mid_x - x_offset) > 0) { center_seed = cv::Point(mid_x - x_offset, y); break; }
                 }
-
-    // 使用加权后的图像重新计算质心
-    M = cv::moments(weighted_roi, false); 
-    
-    is_junction = true;
-    box_color = cv::Scalar(0, 0, 255);
+                if (center_seed.x != -1) break;
             }
+        }
+        if (center_seed.x == -1) is_dead_end = true;
 
-            if (M.m00 > 0) {
-                current_x = x_min + static_cast<int>(M.m10 / M.m00);
-                current_y = y_min + static_cast<int>(M.m01 / M.m00);
-            } else {
-                current_y -= window_height_;
+        int current_x = w / 2;
+        int current_y = roi_h / 2; 
+
+        if (!is_dead_end) {
+            cv::Mat component_mask = extractConnectedComponent(binary, center_seed);
+            if (enable_bottom_touch_filter_ &&
+                !hasBottomTouch(component_mask, w, roi_h)) {
+                is_dead_end = true;
+                cv::putText(debug_vis, "NO BOTTOM TOUCH (REFLECTION)", cv::Point(50, 150),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 165, 255), 2);
             }
-
-            // 画框时使用动态颜色
-            cv::rectangle(debug_vis, cv::Rect(x_min, y_min + roi_y, x_max - x_min, y_max - y_min), box_color, 2);
-            current_y -= window_height_;
         }
 
         if (!is_dead_end) {
-            geometry_msgs::msg::Point p;
-            p.x = static_cast<double>(current_x) / w;
-            p.y = static_cast<double>(current_y + roi_y) / h;
-            corner_pub_->publish(p);
-
-            // ==========================================
-            // 【核心显性绘制：输出直观结果】
-            // ==========================================
+            cv::Point left_seed = center_seed;
+            while(left_seed.x > 0 && binary.at<uchar>(left_seed.y, left_seed.x - 1) > 0) left_seed.x--;
             
-            // 1. 画一个紫色的十字准星，代表最终发给底盘的引导点
-            cv::drawMarker(debug_vis, cv::Point(current_x, current_y + roi_y + window_height_), 
-                           cv::Scalar(255, 0, 255), cv::MARKER_CROSS, 30, 3);
+            cv::Point right_seed = center_seed;
+            while(right_seed.x < w - 1 && binary.at<uchar>(right_seed.y, right_seed.x + 1) > 0) right_seed.x++;
+            
+            int base_width = std::max(20, right_seed.x - left_seed.x);
 
-            // 2. 如果标记了路口，在屏幕上打大字提示
-            if (is_junction) {
-                cv::putText(debug_vis, "JUNCTION -> TURN RIGHT", cv::Point(w / 2 - 200, 100), 
-                            cv::FONT_HERSHEY_SIMPLEX, 1.2, cv::Scalar(0, 0, 255), 3);
+            std::vector<cv::Point> left_edge = traceBoundary(binary, left_seed, 4, true);
+            std::vector<cv::Point> right_edge = traceBoundary(binary, right_seed, 0, false);
+
+            // 【抗光斑强化】：计算轮廓的垂直高度跨度 (Vertical Span)
+            int min_y = roi_h;
+            for(const auto& p : left_edge) min_y = std::min(min_y, p.y);
+            for(const auto& p : right_edge) min_y = std::min(min_y, p.y);
+            int vertical_span = center_seed.y - min_y;
+
+            // 真正的赛道一定会向上延伸很长。如果垂直跨度小于 ROI 高度的 30%（比如是个圆圈光斑），直接干掉！
+            if (left_edge.size() + right_edge.size() < 80 || vertical_span < roi_h * 0.30) {
+                is_dead_end = true;
+            } else {
+                int min_left_x = w;
+                int max_right_x = 0;
+                int max_track_width = 0;
+                
+                std::vector<int> left_b(roi_h, w - 1); 
+                std::vector<int> right_b(roi_h, 0);    
+                
+                for(const auto& p : left_edge) {
+                    left_b[p.y] = std::min(left_b[p.y], p.x); 
+                    min_left_x = std::min(min_left_x, p.x); 
+                    cv::circle(debug_vis, cv::Point(p.x, p.y + roi_y), 2, cv::Scalar(0, 0, 255), -1); 
+                }
+                for(const auto& p : right_edge) {
+                    right_b[p.y] = std::max(right_b[p.y], p.x); 
+                    max_right_x = std::max(max_right_x, p.x); 
+                    cv::circle(debug_vis, cv::Point(p.x, p.y + roi_y), 2, cv::Scalar(255, 0, 0), -1); 
+                }
+
+                for(int y = 0; y < roi_h; y++) {
+                    if (left_b[y] < w - 1 && right_b[y] > 0) {
+                        max_track_width = std::max(max_track_width, right_b[y] - left_b[y]);
+                    }
+                }
+
+                // 【降维打击分类器：通过膨胀和双向展宽区分 L / T / 岔路】
+                bool is_branched = (max_track_width > w * 0.35); // 赛道物理宽度是否发生剧烈膨胀（排除了普通 L 弯）
+                
+                bool is_wide_left = ((center_seed.x - min_left_x) > w * 0.25);
+                bool is_wide_right = ((max_right_x - center_seed.x) > w * 0.25);
+
+                int target_y = roi_h / 2; 
+                while(target_y < roi_h - 1 && (left_b[target_y] == w - 1 || right_b[target_y] == 0)) {
+                    target_y++; 
+                }
+                
+                if (target_y >= roi_h - 1) {
+                    current_x = center_seed.x;
+                    current_y = center_seed.y;
+                } else {
+                    current_y = target_y;
+                    
+                    if (is_branched) {
+                        if (is_wide_left && is_wide_right) {
+                            // T-Junction (双向起飞)
+                            current_x = right_b[target_y] - base_width / 2; 
+                            cv::putText(debug_vis, "T-JUNCTION -> TURN RIGHT", cv::Point(w / 2 - 200, 100), 
+                                        cv::FONT_HERSHEY_SIMPLEX, 1.2, cv::Scalar(0, 0, 255), 3);
+                        } else if (is_wide_left && !is_wide_right) {
+                            // 仅左岔路 -> 忽略左侧，死咬右边缘直行
+                            current_x = right_b[target_y] - base_width / 2; 
+                            cv::putText(debug_vis, "IGNORE LEFT -> GO STRAIGHT", cv::Point(w / 2 - 250, 100), 
+                                        cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 255), 3);
+                        } else if (!is_wide_left && is_wide_right) {
+                            // 仅右岔路 (右 T 型) -> 进入右转逻辑
+                            current_x = right_b[target_y] - base_width / 2; 
+                            cv::putText(debug_vis, "RIGHT BRANCH -> TURN RIGHT", cv::Point(w / 2 - 250, 100), 
+                                        cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 0, 255), 3);
+                        } else {
+                            current_x = (left_b[target_y] + right_b[target_y]) / 2;
+                        }
+                    } else {
+                        // 正常的直线或 L 型弯：取赛道中点，平滑巡线
+                        current_x = (left_b[target_y] + right_b[target_y]) / 2;
+                    }
+                }
+
+                geometry_msgs::msg::Point p;
+                p.x = static_cast<double>(current_x) / w;
+                p.y = static_cast<double>(current_y + roi_y) / h;
+                corner_pub_->publish(p);
+
+                cv::drawMarker(debug_vis, cv::Point(current_x, current_y + roi_y), 
+                               cv::Scalar(255, 0, 255), cv::MARKER_CROSS, 30, 3);
             }
-        } else {
+        } 
+        
+        if (is_dead_end) {
             cv::putText(debug_vis, "DEAD END", cv::Point(50, 100), cv::FONT_HERSHEY_SIMPLEX, 1.5, cv::Scalar(0, 0, 255), 3);
         }
 
         if (show_fps_overlay_ && fps_value_ > 0.0) {
             std::ostringstream fps_ss;
             fps_ss << std::fixed << std::setprecision(1) << "FPS: " << fps_value_;
-            cv::putText(debug_vis, fps_ss.str(), cv::Point(20, 40), cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 0, 0), 4);
             cv::putText(debug_vis, fps_ss.str(), cv::Point(20, 40), cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
         }
 
@@ -237,13 +276,55 @@ private:
         auto debug_msg = cv_bridge::CvImage(header, "bgr8", small_debug).toImageMsg();
         debug_pub_->publish(*debug_msg);
 
-        // ==========================================
-        // 【原生 OpenCV 窗口】
-        // ==========================================
         if (local_debug_display_) {
-            cv::imshow("NATIVE DEBUG VIEW (NO RQT LAG)", debug_vis);
+            cv::imshow("TRUE 8-NEIGHBORHOOD TRACING", debug_vis);
             cv::waitKey(1);
         }
+        
+        return debug_vis;
+    }
+
+    std::vector<cv::Point> traceBoundary(const cv::Mat& bin, cv::Point start, int start_bg_dir, bool clockwise) const {
+        std::vector<cv::Point> edge;
+        cv::Point curr = start;
+        int current_bg_dir = start_bg_dir;
+        
+        const int dx[8] = {1, 1, 0, -1, -1, -1, 0, 1};
+        const int dy[8] = {0, 1, 1, 1, 0, -1, -1, -1};
+        
+        for(int i = 0; i < 2000; i++) { 
+            edge.push_back(curr);
+            
+            if (curr.y <= 0 || curr.x <= 0 || curr.x >= bin.cols - 1) break;
+            if (i > 50 && curr.y >= bin.rows - 1) break;
+            
+            bool found = false;
+            for(int j = 0; j < 8; j++) {
+                int check_dir = clockwise ? (current_bg_dir + j) % 8 : (current_bg_dir - j + 8) % 8;
+                cv::Point p = curr + cv::Point(dx[check_dir], dy[check_dir]);
+                
+                if (p.x < 0 || p.x >= bin.cols || p.y < 0 || p.y >= bin.rows) continue;
+                
+                if (bin.at<uchar>(p) > 0) { 
+                    int bg_idx_before_found = clockwise ? (check_dir - 1 + 8) % 8 : (check_dir + 1) % 8;
+                    cv::Point bg_pixel = curr + cv::Point(dx[bg_idx_before_found], dy[bg_idx_before_found]);
+                    
+                    curr = p; 
+                    cv::Point rel_bg = bg_pixel - curr;
+                    
+                    for(int k = 0; k < 8; k++) {
+                        if(dx[k] == rel_bg.x && dy[k] == rel_bg.y) {
+                            current_bg_dir = k; 
+                            break;
+                        }
+                    }
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) break; 
+        }
+        return edge;
     }
 
     void applyPreFilters(cv::Mat &gray) const {
@@ -261,37 +342,81 @@ private:
         }
     }
 
+    cv::Mat extractConnectedComponent(const cv::Mat &binary, const cv::Point &seed) const {
+        if (binary.empty() || seed.x < 0 || seed.y < 0 || seed.x >= binary.cols || seed.y >= binary.rows) {
+            return {};
+        }
+        if (binary.at<uchar>(seed) == 0) {
+            return {};
+        }
+
+        cv::Mat labels = binary.clone();
+        cv::floodFill(labels, seed, cv::Scalar(128));
+
+        cv::Mat component_mask;
+        cv::compare(labels, cv::Scalar(128), component_mask, cv::CMP_EQ);
+        return component_mask;
+    }
+
+    bool hasBottomTouch(const cv::Mat &component_mask, int width, int height) const {
+        if (component_mask.empty()) {
+            return false;
+        }
+
+        const int rows_to_check = std::clamp(bottom_touch_check_rows_, 1, height);
+        const int min_touch_rows = std::clamp(min_bottom_touch_rows_, 1, rows_to_check);
+        const int x0 = 0;
+        const int x1 = width - 1;
+
+        int hit_rows = 0;
+        for (int i = 0; i < rows_to_check; ++i) {
+            const int y = height - 1 - i;
+            const uchar *row = component_mask.ptr<uchar>(y);
+            bool hit = false;
+            for (int x = x0; x <= x1; ++x) {
+                if (row[x] > 0) {
+                    hit = true;
+                    break;
+                }
+            }
+            if (hit) {
+                ++hit_rows;
+            }
+        }
+        return hit_rows >= min_touch_rows;
+    }
+
+public:
+    void runBatchProcessing() {
+        if (input_video_path_.empty()) return;
+        cv::VideoCapture cap(input_video_path_);
+        if (!cap.isOpened()) return;
+
+        int width = cap.get(cv::CAP_PROP_FRAME_WIDTH);
+        int height = cap.get(cv::CAP_PROP_FRAME_HEIGHT);
+        double fps = cap.get(cv::CAP_PROP_FPS);
+        
+        cv::VideoWriter writer(output_video_path_, cv::VideoWriter::fourcc('m', 'p', '4', 'v'), fps, cv::Size(width, height));
+        RCLCPP_INFO(get_logger(), "开始批处理: %dx%d @ %.2f FPS", width, height, fps);
+
+        cv::Mat frame;
+        while (rclcpp::ok() && cap.read(frame)) {
+            std_msgs::msg::Header header; header.stamp = this->now();
+            cv::Mat processed = processFrame(frame, header);
+            writer.write(processed);
+        }
+        RCLCPP_INFO(get_logger(), "批处理完成！");
+    }
+
+private:
     void applyBorderMask(cv::Mat &mask) const {
         if (mask.empty()) return;
         const int margin = std::max(0, border_margin_px_);
         if (margin == 0) return;
-        
-        const int max_margin_x = std::max(0, mask.cols / 2 - 1);
-        const int max_margin_y = std::max(0, mask.rows / 2 - 1);
-        const int margin_x = std::min(margin, max_margin_x);
-        const int margin_y = std::min(margin, max_margin_y);
-
-        if (margin_y > 0) {
-            mask.rowRange(0, margin_y).setTo(0);
-            mask.rowRange(mask.rows - margin_y, mask.rows).setTo(0);
-        }
-        if (margin_x > 0) {
-            mask.colRange(0, margin_x).setTo(0);
-            mask.colRange(mask.cols - margin_x, mask.cols).setTo(0);
-        }
-    }
-
-    int countTransitions(const cv::Mat& roi) const {
-        int transitions = 0;
-        int w = roi.cols, h = roi.rows;
-        if (w < 2 || h < 2) return 0;
-        int prev = roi.at<uchar>(0, 0);
-        auto check = [&](int val) { if (val != prev) { transitions++; prev = val; } };
-        for (int x = 0; x < w; ++x) check(roi.at<uchar>(0, x));
-        for (int y = 1; y < h; ++y) check(roi.at<uchar>(y, w - 1));
-        for (int x = w - 2; x >= 0; --x) check(roi.at<uchar>(h - 1, x));
-        for (int y = h - 2; y > 0; --y) check(roi.at<uchar>(y, 0));
-        return transitions / 2;
+        const int margin_x = std::min(margin, mask.cols / 2 - 1);
+        const int margin_y = std::min(margin, mask.rows / 2 - 1);
+        if (margin_y > 0) { mask.rowRange(0, margin_y).setTo(0); mask.rowRange(mask.rows - margin_y, mask.rows).setTo(0); }
+        if (margin_x > 0) { mask.colRange(0, margin_x).setTo(0); mask.colRange(mask.cols - margin_x, mask.cols).setTo(0); }
     }
 
     void updateRealtimeFps() {
@@ -299,26 +424,26 @@ private:
         if (!fps_initialized_) { last_frame_tp_ = now; fps_initialized_ = true; return; }
         std::chrono::duration<double> dt = now - last_frame_tp_;
         last_frame_tp_ = now;
-        if (dt.count() > 1e-6) {
-            fps_value_ = fps_ema_alpha_ * (1.0 / dt.count()) + (1.0 - fps_ema_alpha_) * fps_value_;
-        }
+        if (dt.count() > 1e-6) fps_value_ = fps_ema_alpha_ * (1.0 / dt.count()) + (1.0 - fps_ema_alpha_) * fps_value_; 
     }
 
     std::string image_topic_, corner_topic_, debug_topic_, binary_topic_;
-    std::vector<double> region_weights_;
     double roi_ratio_, auto_thresh_k_;
     bool auto_threshold_;
     int threshold_, auto_thresh_min_, auto_thresh_max_;
     int blur_ksize_, bilateral_d_;
     double bilateral_sigma_color_, bilateral_sigma_space_;
     int morph_ksize_, close_ksize_, open_ksize_, border_margin_px_;
-    
-    // 改成了独立的宽和高
-    int window_width_, window_height_, num_windows_;
+    bool enable_bottom_touch_filter_;
+    int bottom_touch_check_rows_, min_bottom_touch_rows_;
     
     double fps_ema_alpha_, fps_value_{0.0};
     bool show_fps_overlay_, fps_initialized_{false}, local_debug_display_;
     std::chrono::steady_clock::time_point last_frame_tp_;
+
+    bool batch_mode_;              
+    std::string input_video_path_; 
+    std::string output_video_path_;
 
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub_;
     rclcpp::Publisher<geometry_msgs::msg::Point>::SharedPtr corner_pub_;
@@ -328,7 +453,11 @@ private:
 
 int main(int argc, char ** argv) {
     rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<EightNavNode>());
+    auto node = std::make_shared<EightNavNode>();
+    bool is_batch = false; 
+    node->get_parameter("batch_mode", is_batch);
+    if (is_batch) node->runBatchProcessing();
+    else rclcpp::spin(node);
     rclcpp::shutdown();
     return 0;
 }
